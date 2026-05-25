@@ -195,8 +195,12 @@ def _find_brand_col(df_raw, start_row, end_col, sample_rows=40):
     best_col = 0
     best_score = -1
     for col in range(end_col):
-        sample = df_raw.iloc[start_row:start_row + sample_rows, col].astype(str).str.lower()
-        score = sample.apply(lambda x: any(kb in str(x).upper() for kb in KNOWN_BRANDS) if pd.notna(x) else False).sum()
+        sample = df_raw.iloc[start_row:start_row + sample_rows, col]
+        score = sample.apply(
+            lambda x: any(kb in str(x).upper() for kb in KNOWN_BRANDS) 
+            if pd.notna(x) else False
+        ).sum()
+        
         if score > best_score:
             best_score = score
             best_col = col
