@@ -7,9 +7,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import logging
 
-
-def jalankan_lstm_dinamis(df_input, time_steps=12, train_split=0.8):
-    # ── 1. Agregasi ke nasional (1 baris per bulan) ──────────────────────────
+def jalankan_lstm_dinamis(df_input, time_steps=36, train_split=0.8):
     df_nasional = (
         df_input.groupby('Tanggal')['Aktual']
         .sum()
@@ -21,26 +19,26 @@ def jalankan_lstm_dinamis(df_input, time_steps=12, train_split=0.8):
     n_total = len(df_nasional)
     logging.info(f"[LSTM] Total bulan data nasional: {n_total}")
 
-    if n_total < time_steps + 15:
-        logging.warning(f"[LSTM] Data tidak cukup ({n_total} bulan). Butuh minimal {time_steps + 15}.")
+    # Menurunkan batas aman minimum agar bisa diproses untuk skenario 2 tahun
+    if n_total <= time_steps:
+        logging.warning(f"[LSTM] Data terlalu sedikit ({n_total} bulan). Butuh > {time_steps}.")
         return None, 0.0, 0.0, 0.0, None
 
-    # ── 2. Scaling ──────────────────────────────────────────────────────────
     data = df_nasional['Aktual'].values.reshape(-1, 1)
     scaler = MinMaxScaler(feature_range=(0, 1))
     scaled = scaler.fit_transform(data)
 
-    # ── 3. Sliding window features ─────────────────────────────────────────
     X, y = [], []
     for i in range(n_total - time_steps):
         X.append(scaled[i:i + time_steps, 0])
         y.append(scaled[i + time_steps, 0])
     X, y = np.array(X), np.array(y)
 
-    # ── 4. Split: pastikan test set minimal 12 titik (1 tahun) ─────────────
-    min_test = max(12, int(len(X) * (1 - train_split)))
+    # Turunkan batas minimal test dari 12 menjadi 3 untuk mengakomodasi data pendek
+    min_test = max(3, int(len(X) * (1 - train_split)))
     split_idx = len(X) - min_test
-    if split_idx < time_steps:
+    
+    if split_idx < 1:
         logging.warning(f"[LSTM] Train set terlalu kecil setelah split ({split_idx} sampel).")
         return None, 0.0, 0.0, 0.0, None
 
@@ -48,12 +46,10 @@ def jalankan_lstm_dinamis(df_input, time_steps=12, train_split=0.8):
     y_train, y_test = y[:split_idx], y[split_idx:]
     logging.info(f"[LSTM] Train: {len(X_train)} | Test: {len(X_test)} sampel")
 
-    # Reshape untuk LSTM: (samples, timesteps, features)
     X_train_3d = X_train.reshape(-1, time_steps, 1)
     X_test_3d  = X_test.reshape(-1,  time_steps, 1)
     X_all_3d   = X.reshape(-1,       time_steps, 1)
 
-    # ── 5. Model ────────────────────────────────────────────────────────────
     model = Sequential([
         LSTM(64, return_sequences=True, input_shape=(time_steps, 1)),
         Dropout(0.2),
@@ -62,7 +58,7 @@ def jalankan_lstm_dinamis(df_input, time_steps=12, train_split=0.8):
         Dense(16, activation='relu'),
         Dense(1),
     ])
-    model.compile(optimizer='adam', loss='huber')  # Huber robust vs outlier COVID
+    model.compile(optimizer='adam', loss='huber')
 
     callbacks = [
         EarlyStopping(monitor='val_loss', patience=20,
@@ -80,7 +76,6 @@ def jalankan_lstm_dinamis(df_input, time_steps=12, train_split=0.8):
         verbose=0,
     )
 
-    # ── 6. Evaluasi ─────────────────────────────────────────────────────────
     pred_test = scaler.inverse_transform(
         model.predict(X_test_3d, verbose=0)
     ).flatten()

@@ -1,3 +1,6 @@
+import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -19,8 +22,24 @@ if 'init_prep' not in st.session_state:
         prep_internal_data()
     st.session_state.init_prep = True
 
+# --- FITUR: KONFIGURASI PREDIKSI & EKSPERIMEN ---
+st.sidebar.header("Konfigurasi Prediksi & Eksperimen")
+pred_horizon = st.sidebar.selectbox(
+    "Jumlah Bulan Prediksi ke Depan:", 
+    options=[3, 6, 12, 18, 24, 36], 
+    index=2,
+    help="Pilih horizon ramalan. Makin jauh bulan prediksi, data latih yang dibutuhkan makin besar."
+)
+
+time_steps_param = st.sidebar.selectbox(
+    "Ukuran Sliding Window (Time Steps):",
+    options=[6, 12, 24, 36],
+    index=1,
+    help="Jumlah bulan historis masa lalu yang digunakan model sebagai acuan prediksi."
+)
+
 @st.cache_data
-def load_real_data(file_path="Data_Bersih_Gaikindo_ALL_YEARS.csv"):
+def load_real_data(file_path="Data_Bersih_Gaikindo_ALL_YEARS.csv", horizon=12, t_steps=36):
     try:
         df = pd.read_csv(file_path)
     except FileNotFoundError:
@@ -29,21 +48,19 @@ def load_real_data(file_path="Data_Bersih_Gaikindo_ALL_YEARS.csv"):
 
     df['Tanggal'] = pd.to_datetime(df['Tanggal'])
 
-    # --- Latih XGBoost & LSTM sungguhan untuk prediksi historis ---
     from model_xgboost import jalankan_xgboost_dinamis
     from model_lstm import jalankan_lstm_dinamis
 
     df_nasional = df.groupby('Tanggal')['Aktual'].sum().reset_index().sort_values('Tanggal')
 
-    _, _, _, _, pred_xgb_all  = jalankan_xgboost_dinamis(df, time_steps=12, train_split=0.8)
-    _, _, _, _, pred_lstm_all = jalankan_lstm_dinamis(df,    time_steps=12, train_split=0.8)
+    # Menggunakan parameter t_steps dinamis dari sidebar
+    _, _, _, _, pred_xgb_all  = jalankan_xgboost_dinamis(df, time_steps=t_steps, train_split=0.8)
+    _, _, _, _, pred_lstm_all = jalankan_lstm_dinamis(df,    time_steps=t_steps, train_split=0.8)
 
     n_xgb  = len(pred_xgb_all)  if pred_xgb_all  is not None else 0
     n_lstm = len(pred_lstm_all) if pred_lstm_all is not None else 0
     n_total = len(df_nasional)
 
-    # Mapping prediksi nasional (per-tanggal) ke df per brand/model
-    # XGBoost (time_steps=3): prediksi mulai dari index ke-3
     xgb_series  = pd.Series(np.nan, index=range(n_total))
     lstm_series = pd.Series(np.nan, index=range(n_total))
 
@@ -52,11 +69,9 @@ def load_real_data(file_path="Data_Bersih_Gaikindo_ALL_YEARS.csv"):
     if n_lstm > 0:
         lstm_series.iloc[n_total - n_lstm:] = pred_lstm_all
 
-    # Buat mapping tanggal → nilai prediksi nasional
     xgb_map  = dict(zip(df_nasional['Tanggal'], xgb_series.values))
     lstm_map = dict(zip(df_nasional['Tanggal'], lstm_series.values))
 
-    # Hitung bobot per brand berdasarkan share aktual
     total_per_tgl = df.groupby('Tanggal')['Aktual'].sum().replace(0, np.nan)
 
     df['_total_tgl'] = df['Tanggal'].map(total_per_tgl)
@@ -65,39 +80,34 @@ def load_real_data(file_path="Data_Bersih_Gaikindo_ALL_YEARS.csv"):
     df['Prediksi_XGBoost'] = df['Tanggal'].map(xgb_map) * df['_share']
     df['Prediksi_LSTM']    = df['Tanggal'].map(lstm_map) * df['_share']
 
-    # Fallback: jika prediksi NaN (periode awal sebelum window), gunakan aktual
     df['Prediksi_XGBoost'] = df['Prediksi_XGBoost'].fillna(df['Aktual'])
     df['Prediksi_LSTM']    = df['Prediksi_LSTM'].fillna(df['Aktual'])
 
     df.drop(columns=['_total_tgl', '_share'], inplace=True)
 
-    # --- Future forecast 24 bulan: gunakan model yang sudah dilatih ---
     future_data = []
     last_date = df['Tanggal'].max()
     brands = df['Brand'].unique()
     fuels  = df['Segment_Fuel'].unique()
 
-    # Ambil deret nasional terakhir untuk rolling forecast
     actuals_scaled = df_nasional['Aktual'].values
 
-    for i in range(1, 25):
+    # GENERATE FUTURE DATA BERDASARKAN HORIZON
+    for i in range(1, horizon + 1):
         future_date = last_date + pd.DateOffset(months=i)
 
-        # Prediksi nasional pakai trend 12-bulan terakhir (weighted moving avg)
         window = actuals_scaled[-12:] if len(actuals_scaled) >= 12 else actuals_scaled
         weights = np.arange(1, len(window) + 1, dtype=float)
         national_base = np.average(window, weights=weights)
 
-        # Terapkan trend sederhana dari 12 bulan terakhir
         if len(actuals_scaled) >= 13:
             recent_trend = (actuals_scaled[-1] / actuals_scaled[-13]) ** (1/12)
-            recent_trend = np.clip(recent_trend, 0.95, 1.05)  # batasi ±5%/bulan
+            recent_trend = np.clip(recent_trend, 0.95, 1.05)
         else:
             recent_trend = 1.0
 
         national_forecast = national_base * (recent_trend ** i)
 
-        # Distribusi per brand/fuel berdasarkan share rata-rata 12 bulan terakhir
         recent_df = df[df['Tanggal'] >= (last_date - pd.DateOffset(months=12))]
         share_df  = recent_df.groupby(['Brand', 'Segment_Fuel'])['Aktual'].mean()
         total_share = share_df.sum()
@@ -112,7 +122,6 @@ def load_real_data(file_path="Data_Bersih_Gaikindo_ALL_YEARS.csv"):
                 trend_mult  = 1.03 if 'Elektrik' in f or 'Hybrid' in f else 0.98
                 base_val    = national_forecast * share_ratio * (trend_mult ** i)
 
-                # Tambahkan sedikit variasi realistis (bukan pure random)
                 np.random.seed(42 + i)
                 xgb_pred  = max(0, base_val * np.random.normal(1, 0.03))
                 lstm_pred = max(0, base_val * np.random.normal(1, 0.05))
@@ -134,14 +143,13 @@ def load_real_data(file_path="Data_Bersih_Gaikindo_ALL_YEARS.csv"):
 
     return df
 
-df = load_real_data()
+# Memasukkan argumen time_steps ke fungsi cache
+df = load_real_data(horizon=pred_horizon, t_steps=time_steps_param)
 if df.empty:
     st.stop()
 
 st.title("AutoSight Analytics: Advanced Forecasting")
 st.markdown("Decision Support System untuk Prediksi Penjualan Mobil Nasional berdasarkan data GAIKINDO.")
-
-st.sidebar.header("Konfigurasi Prediksi")
 
 st.sidebar.markdown("**Tren Historis Total (Sparkline)**")
 spark_df = df.groupby('Tanggal')['Aktual'].sum().reset_index().dropna()
@@ -153,7 +161,7 @@ st.sidebar.plotly_chart(fig_spark, use_container_width=True)
 min_date = df['Tanggal'].min().date()
 max_date = df['Tanggal'].max().date()
 start_date, end_date = st.sidebar.slider(
-    "Rentang Waktu Analisis:",
+    "Rentang Waktu Analisis (Untuk Grafik Visual):",
     min_value=min_date, max_value=max_date,
     value=(min_date, max_date)
 )
@@ -172,7 +180,6 @@ selected_models = st.sidebar.multiselect(
     help="Pilih produk spesifik untuk diprediksi. Kosongkan jika ingin melihat keseluruhan brand."
 )
 selected_fuels = st.sidebar.multiselect("Segmentasi Bahan Bakar:", sorted(df['Segment_Fuel'].dropna().unique()), default=df['Segment_Fuel'].dropna().unique())
-
 
 mask = (
     (df['Tanggal'].dt.date >= start_date) &
@@ -204,28 +211,43 @@ if uploaded_file is not None:
 st.subheader("Model Performance Showdown (Live Training)")
 st.markdown("Klik tombol di bawah untuk melatih AI **XGBoost** dan **LSTM** menggunakan dataset yang saat ini Anda pilih/upload secara *real-time*.")
 
+min_year = int(df['Tanggal'].dt.year.min())
+max_year = int(df['Tanggal'].dt.year.max())
+train_start_year, train_end_year = st.slider(
+    "🎯 Pilih Rentang Tahun untuk Data Latih (Training):",
+    min_value=min_year, max_value=max_year,
+    value=(min_year, max_year),
+    help="Hanya data dari rentang tahun ini yang akan dipelajari oleh algoritma saat tombol ditekan."
+)
+
 if 'sudah_dilatih' not in st.session_state:
     st.session_state.sudah_dilatih = False
     st.session_state.mae_xgb, st.session_state.rmse_xgb, st.session_state.r2_xgb = 0.0, 0.0, 0.0
     st.session_state.mae_lstm, st.session_state.rmse_lstm, st.session_state.r2_lstm = 0.0, 0.0, 0.0
 
-MIN_BULAN_VALID = 27  # 12 time_steps + 15 buffer minimum untuk R² yang valid
+MIN_BULAN_VALID = 15
 
 if st.button("🚀 Jalankan Ulang Pelatihan Model (Live)"):
     with st.spinner("⚙️ Memproses ulang Excel internal dan melatih model (15-30 detik)..."):
 
         prep_internal_data()
         load_real_data.clear()
-        df_terbaru = load_real_data()
+        
+        # Memasukkan argumen time_steps ke panggilan saat live training
+        df_terbaru = load_real_data(horizon=pred_horizon, t_steps=time_steps_param)
 
-        # --- Tentukan data kandidat sesuai konteks user ---
         if user_df is not None:
             df_base = user_df.copy()
         else:
             df_base = df_terbaru[df_terbaru['Aktual'].notna()].copy()
         df_base = df_base[df_base['Aktual'] > 0]
 
-        # --- Coba latih di data yang difilter user (brand/fuel/model) ---
+        # --- PEMOTONGAN DATA LATIH BERDASARKAN SLIDER TAHUN TRAINING ---
+        df_base = df_base[
+            (df_base['Tanggal'].dt.year >= train_start_year) &
+            (df_base['Tanggal'].dt.year <= train_end_year)
+        ]
+
         df_filtered_train = df_base[
             (df_base['Brand'].isin(selected_brands)) &
             (df_base['Segment_Fuel'].isin(selected_fuels))
@@ -236,12 +258,10 @@ if st.button("🚀 Jalankan Ulang Pelatihan Model (Live)"):
         n_bulan_filtered = df_filtered_train.groupby('Tanggal')['Aktual'].sum().shape[0]
 
         if n_bulan_filtered >= MIN_BULAN_VALID:
-            # ✅ Data seleksi cukup → latih sesuai konteks user
             data_untuk_model = df_filtered_train
             konteks_training = f"seleksi ({len(selected_brands)} brand, {n_bulan_filtered} bulan)"
             st.session_state.training_fallback = False
         else:
-            # ⚠️ Data seleksi kurang → fallback ke nasional penuh
             data_untuk_model = df_base
             n_bulan_nasional = df_base.groupby('Tanggal')['Aktual'].sum().shape[0]
             konteks_training = f"nasional penuh ({n_bulan_nasional} bulan) — seleksi hanya {n_bulan_filtered} bulan, tidak cukup"
@@ -283,7 +303,6 @@ if st.session_state.sudah_dilatih:
     delta_rmse = rmse_lstm - rmse_xgb
     delta_r2   = (r2_lstm  - r2_xgb) * 100
 
-    # Banner konteks training
     konteks = st.session_state.get('konteks_training', '')
     if st.session_state.get('training_fallback', False):
         st.warning(
@@ -345,7 +364,6 @@ fig_main = go.Figure()
 split_index = int(len(df) * 0.7)
 tanggal_pembatas = df['Tanggal'].iloc[split_index]
 
-# Jika Live Training sudah dijalankan, overlay hasil model ke main_df
 main_df_plot = main_df.copy()
 if st.session_state.get('sudah_dilatih') and st.session_state.get('pred_all_xgb') is not None:
     df_nasional_hist = df[df['Aktual'].notna()].groupby('Tanggal')['Aktual'].sum().reset_index().sort_values('Tanggal')
@@ -463,7 +481,7 @@ if agg_user_df is not None and not agg_user_df.empty:
             anomali_detected = True
             anomali_count = len(anomali_df)
             
-            st.error(f"⚠️ **Peringatan!** Terdeteksi {anomali_count} anomali pada data yang diupload.")
+            st.error(f"**Peringatan!** Terdeteksi {anomali_count} anomali pada data yang diupload.")
             st.warning(f"Terdapat angka penjualan yang menyimpang jauh (>{TOLERANCE_PCT}%) dari *baseline* prediksi.")
             
             display_df = anomali_df.copy()
@@ -475,7 +493,7 @@ if agg_user_df is not None and not agg_user_df.empty:
             
             st.dataframe(display_df[['Tanggal', 'Aktual (Upload)', 'Prediksi Model', 'Status', 'Persentase Anomali']], use_container_width=True)
         else:
-            st.success(f"✅ Data eksternal tervalidasi. Seluruh poin data berada di dalam batas aman toleransi (±{TOLERANCE_PCT}%).")
+            st.success(f"Data eksternal tervalidasi. Seluruh poin data berada di dalam batas aman toleransi (±{TOLERANCE_PCT}%).")
 
 st.markdown("---")
 

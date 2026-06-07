@@ -5,8 +5,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import logging
 
-
-def jalankan_xgboost_dinamis(df_input, time_steps=12, train_split=0.8):
+def jalankan_xgboost_dinamis(df_input, time_steps=36, train_split=0.8):
     # ── 1. Agregasi ke nasional (1 baris per bulan) ──────────────────────────
     df_nasional = (
         df_input.groupby('Tanggal')['Aktual']
@@ -19,26 +18,25 @@ def jalankan_xgboost_dinamis(df_input, time_steps=12, train_split=0.8):
     n_total = len(df_nasional)
     logging.info(f"[XGBoost] Total bulan data nasional: {n_total}")
 
-    if n_total < time_steps + 10:
-        logging.warning(f"[XGBoost] Data tidak cukup ({n_total} bulan). Butuh minimal {time_steps + 10}.")
+    # Menurunkan batas aman minimum agar bisa diproses untuk skenario 2 tahun
+    if n_total <= time_steps:
+        logging.warning(f"[XGBoost] Data terlalu sedikit ({n_total} bulan). Butuh > {time_steps}.")
         return None, 0.0, 0.0, 0.0, None
 
-    # ── 2. Scaling ──────────────────────────────────────────────────────────
     data = df_nasional['Aktual'].values.reshape(-1, 1)
     scaler = MinMaxScaler(feature_range=(0, 1))
     scaled = scaler.fit_transform(data)
 
-    # ── 3. Sliding window features ─────────────────────────────────────────
     X, y = [], []
     for i in range(n_total - time_steps):
         X.append(scaled[i:i + time_steps, 0])
         y.append(scaled[i + time_steps, 0])
     X, y = np.array(X), np.array(y)
 
-    # ── 4. Split: pastikan test set minimal 12 titik (1 tahun) ─────────────
-    min_test = max(12, int(len(X) * (1 - train_split)))
+    # Turunkan batas minimal test dari 12 menjadi 3 untuk mengakomodasi data pendek
+    min_test = max(3, int(len(X) * (1 - train_split)))
     split_idx = len(X) - min_test
-    if split_idx < time_steps:
+    if split_idx < 1:
         logging.warning(f"[XGBoost] Train set terlalu kecil setelah split ({split_idx} sampel).")
         return None, 0.0, 0.0, 0.0, None
 
@@ -46,12 +44,11 @@ def jalankan_xgboost_dinamis(df_input, time_steps=12, train_split=0.8):
     y_train, y_test = y[:split_idx], y[split_idx:]
     logging.info(f"[XGBoost] Train: {len(X_train)} | Test: {len(X_test)} sampel")
 
-    # ── 5. Model ────────────────────────────────────────────────────────────
     model_xgb = xgb.XGBRegressor(
         objective='reg:squarederror',
         n_estimators=300,
         learning_rate=0.05,
-        max_depth=3,          # dangkal → lebih general untuk time series pendek
+        max_depth=3,
         subsample=0.8,
         colsample_bytree=0.8,
         min_child_weight=2,
@@ -65,7 +62,6 @@ def jalankan_xgboost_dinamis(df_input, time_steps=12, train_split=0.8):
         verbose=False,
     )
 
-    # ── 6. Evaluasi ─────────────────────────────────────────────────────────
     pred_test_scaled = model_xgb.predict(X_test)
     pred_all_scaled  = model_xgb.predict(X)
 

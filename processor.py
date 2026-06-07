@@ -21,7 +21,7 @@ MONTH_MAP = {
     'aug': '08', 'agu': '08', 'agt': '08',
     'sep': '09',
     'oct': '10', 'okt': '10',
-    'nov': '11',
+    'nov': '11', 'nop': '11',
     'dec': '12', 'des': '12',
 }
 
@@ -33,6 +33,7 @@ MONTH_ALIASES = {
     'mei': 'may',
     'agu': 'aug', 'agt': 'aug',
     'okt': 'oct',
+    'nop': 'nov',
     'des': 'dec',
 }
 
